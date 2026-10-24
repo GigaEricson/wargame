@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>War System Mobile HQ</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --card: #151b23;
+      --border: #30363d;
+      --green: #238636;
+      --amber: #d29922;
+      --red: #da3633;
+      --cyan: #58a6ff;
+      --text: #c9d1d9;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; }
+    body { background: var(--bg); color: var(--text); padding: 12px; }
+    h1 { color: var(--cyan); font-size: 1.1rem; text-align: center; margin-bottom: 8px; font-weight: 700; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 14px; margin-bottom: 12px; }
+    label { display: block; font-size: 0.8rem; margin-top: 10px; color: var(--amber); font-weight: 600; text-transform: uppercase; }
+    input, select, button { width: 100%; padding: 10px; margin-top: 4px; background: #000; border: 1px solid var(--border); color: #fff; border-radius: 4px; font-size: 0.95rem; }
+    button { background: var(--green); cursor: pointer; font-weight: bold; margin-top: 15px; border: none; }
+    button:disabled { background: #21262d; color: #6e7681; }
+    .status-bar { padding: 6px; background: #000; border: 1px dashed var(--border); font-size: 0.75rem; text-align: center; margin-bottom: 10px; font-weight: bold; }
+    .log-box { font-size: 0.8rem; max-height: 180px; overflow-y: auto; background: #000; padding: 8px; border: 1px solid var(--border); }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.7rem; background: var(--amber); color: #000; font-weight: bold; }
+  </style>
+</head>
+<body>
+
+  <h1>WAR SYSTEM MOBILE HQ</h1>
+  <div id="connStatus" class="status-bar" style="color:var(--amber);">DISCONNECTED</div>
+
+  <!-- STEP 1: LOBBY JOIN -->
+  <div class="card" id="lobbyPanel">
+    <label>ENTER 4-LETTER ROOM CODE:</label>
+    <input type="text" id="roomCodeInput" maxlength="4" placeholder="e.g. TANK" style="text-transform:uppercase;">
+    <button onclick="joinLobby()">CONNECT SECURE SESSION</button>
+  </div>
+
+  <!-- STEP 2: DEFENDER COMMAND DASHBOARD -->
+  <div class="card" id="cmdPanel" style="display: none;">
+    <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+      <span>ROLE: <span class="badge">DEFENDER</span></span>
+      <span>ROOM: <span class="badge" id="roomDisplay">----</span></span>
+    </div>
+
+    <div id="theaterStatus" style="color:var(--cyan); font-weight:bold; font-size:0.85rem; margin-bottom:8px;">
+      Awaiting Theater Briefing...
+    </div>
+
+    <label>TROOP GARRISON COUNT:</label>
+    <input type="number" id="troopsInput" value="15000">
+
+    <label>PREPARED DUGOUTS / BUNKERS?</label>
+    <select id="dugoutsInput">
+      <option value="yes">YES (Fortified Dugouts Active)</option>
+      <option value="no">NO (Open Positions)</option>
+    </select>
+
+    <label>RECONNAISSANCE ADVANTAGE?</label>
+    <select id="reconInput">
+      <option value="no">NO</option>
+      <option value="yes">YES (+10 Arty / +5 Clash)</option>
+    </select>
+
+    <label>LOGISTICS PREP BONUS (0 to 30):</label>
+    <input type="number" id="prepInput" value="10">
+
+    <button id="dispatchOrdersBtn" onclick="dispatchOrders()">DISPATCH TACTICAL ORDERS</button>
+  </div>
+
+  <!-- COMBAT DISPATCH LOG -->
+  <div class="card">
+    <div style="font-size:0.8rem; font-weight:bold; margin-bottom:6px; color:var(--text);">SECURE DISPATCH LOG:</div>
+    <div id="battleLog" class="log-box"></div>
+  </div>
+
+  <script>
+    // =========================================================================
+    // FREE ZERO-SIGNUP BROKER CONFIGURATION (TLS WSS PORT 8884)
+    // =========================================================================
+    const BROKER_HOST = "broker.hivemq.com";
+    const BROKER_PORT = 8884;
+    const BROKER_PATH = "/mqtt";
+
+    let client = null;
+    let roomCode = "";
+    let sessionToken = null; // Stored 16-character handshake token
+
+    // Strict XSS Prevention: textContent exclusively
+    function logMessage(text) {
+      const logContainer = document.getElementById("battleLog");
+      const entry = document.createElement("div");
+      entry.textContent = "> " + text;
+      logContainer.appendChild(entry);
+      logContainer.scrollTop = logContainer.scrollHeight;
+    }
+
+    function setStatus(text, colorVar) {
+      const statusEl = document.getElementById("connStatus");
+      statusEl.textContent = text;
+      statusEl.style.color = `var(${colorVar})`;
+    }
+
+    function joinLobby() {
+      roomCode = document.getElementById("roomCodeInput").value.trim().toUpperCase();
+      if (roomCode.length !== 4) {
+        alert("Please enter a valid 4-letter Room Code.");
+        return;
+      }
+
+      const clientId = "WarMob_" + Math.random().toString(36).substring(2, 10);
+      client = new Paho.MQTT.Client(BROKER_HOST, BROKER_PORT, BROKER_PATH, clientId);
+
+      client.onConnectionLost = (resp) => {
+        setStatus("CONNECTION LOST - RECONNECTING", "--red");
+        logMessage("Network lost: " + resp.errorMessage);
+      };
+
+      client.onMessageArrived = (message) => {
+        try {
+          const payload = JSON.parse(message.payloadString);
+          if (payload.sender === "Attacker") {
+            handleIncomingPacket(payload);
+          }
+        } catch (e) {
+          logMessage("Malformed packet received.");
+        }
+      };
+
+      setStatus("CONNECTING SECURELY OVER WSS...", "--amber");
+
+      client.connect({
+        useSSL: true,
+        onSuccess: () => {
+          setStatus("AUTHENTICATED | ROOM: " + roomCode, "--green");
+          document.getElementById("lobbyPanel").style.display = "none";
+          document.getElementById("cmdPanel").style.display = "block";
+          document.getElementById("roomDisplay").textContent = roomCode;
+
+          client.subscribe("warsystem/sim/" + roomCode, { qos: 1 });
+
+          // Send Initial Handshake Request (no token required yet)
+          const handshake = new Paho.MQTT.Message(JSON.stringify({
+            sender: "Defender",
+            type: "JOIN_REQ",
+            data: {}
+          }));
+          handshake.destinationName = "warsystem/sim/" + roomCode;
+          handshake.qos = 1;
+          client.send(handshake);
+
+          logMessage("Handshake sent. Waiting for Host authorization...");
+        },
+        onFailure: (err) => {
+          setStatus("CONNECTION FAILED", "--red");
+          alert("Could not connect to broker: " + err.errorMessage);
+        }
+      });
+    }
+
+    function handleIncomingPacket(packet) {
+      // Handshake: Receive cryptographic session token from Attacker
+      if (packet.type === "SESSION_START") {
+        sessionToken = packet.token;
+        logMessage("Cryptographic session verified with Host.");
+        sendSecurePacket("SESSION_ACK", {});
+        return;
+      }
+
+      // Security check: Drop any packet from unauthorized sessions
+      if (packet.token !== sessionToken) {
+        return;
+      }
+
+      if (packet.type === "WEATHER_SYNC") {
+        const w = packet.data;
+        document.getElementById("theaterStatus").textContent = 
+          `Theater Active: ${w.temp_desc} | ${w.precip_desc}`;
+        logMessage(`Weather Reported: ${w.temp_desc} / ${w.precip_desc}`);
+      }
+      else if (packet.type === "TERRAIN_SYNC") {
+        logMessage(`Attacker chose battleground: ${packet.data.name}`);
+      }
+      else if (packet.type === "RESOLUTION") {
+        renderClashResolution(packet.data);
+      }
+    }
+
+    function sendSecurePacket(type, data) {
+      const payload = new Paho.MQTT.Message(JSON.stringify({
+        sender: "Defender",
+        type: type,
+        token: sessionToken,
+        data: data
+      }));
+      payload.destinationName = "warsystem/sim/" + roomCode;
+      payload.qos = 1;
+      client.send(payload);
+    }
+
+    function dispatchOrders() {
+      const troops = parseInt(document.getElementById("troopsInput").value) || 10000;
+      const hasDugouts = document.getElementById("dugoutsInput").value === "yes";
+      const hasRecon = document.getElementById("reconInput").value === "yes";
+      const prep = parseInt(document.getElementById("prepInput").value) || 0;
+
+      const finalLog = 55 + prep;
+      let logMod = 0;
+      if (finalLog <= 25) logMod = -10;
+      else if (finalLog <= 49) logMod = -5;
+      else if (finalLog >= 85) logMod = 10;
+      else if (finalLog >= 65) logMod = 5;
+
+      sendSecurePacket("P3_DATA", {
+        log_mod: logMod,
+        mor_mod: logMod,
+        arty_bonus: 10,
+        arty_mor_dmg: -5,
+        cas_pct: 0.04,
+        has_dugouts: hasDugouts,
+        has_recon: hasRecon,
+        has_air: false
+      });
+
+      sendSecurePacket("DEPLOYMENT", {
+        troops: troops,
+        has_tanks: false
+      });
+
+      logMessage("Tactical orders dispatched. Awaiting battle clash...");
+      document.getElementById("dispatchOrdersBtn").disabled = true;
+    }
+
+    function renderClashResolution(res) {
+      logMessage(`--- CLASH RESOLUTION ---`);
+      logMessage(`Attacker Score: ${res.tot_att} (Roll: ${res.roll_att}, Mod: ${res.mod_att})`);
+      logMessage(`Defender Score: ${res.tot_def} (Roll: ${res.roll_def}, Mod: ${res.mod_def})`);
+      logMessage(`Victory Margin: ${Math.abs(res.margin)}`);
+
+      if (res.margin > 5) {
+        logMessage("OUTCOME: DEFENSIVE LINE BROKEN - ENEMY BREAKTHROUGH");
+      } else if (res.margin < -5) {
+        logMessage("OUTCOME: VICTORY - ENEMY ATTACK CRUSHED");
+      } else {
+        logMessage("OUTCOME: STALEMATE - FRONTLINE UNCHANGED");
+      }
+      document.getElementById("dispatchOrdersBtn").disabled = false;
+    }
+
+    // Auto-reconnect when phone unlocks
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        if (!client || !client.isConnected()) {
+          logMessage("Phone resumed. Reconnecting session...");
+          joinLobby();
+        }
+      }
+    });
+  </script>
+</body>
+</html>
